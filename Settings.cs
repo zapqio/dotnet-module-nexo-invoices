@@ -87,5 +87,11 @@ namespace Nexo
         /// </summary>
         public string RMPFlagName { get; set; }
 
+        /// <summary>Ile razy po zapisie faktury sprawdzać, czy dostała numer KSeF. 0 = nie czekać.</summary>
+        public int KsefPollAttempts { get; set; } = 15;
+
+        /// <summary>Odstęp między kolejnymi sprawdzeniami KSeF (sekundy).</summary>
+        public int KsefPollIntervalSeconds { get; set; } = 20;
+
     }
 }

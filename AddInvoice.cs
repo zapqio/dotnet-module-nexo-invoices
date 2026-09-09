@@ -1,18 +1,20 @@
-﻿using InsERT.Moria.Dokumenty.Logistyka;
+﻿using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Reflection.Metadata;
+using System.Security.Cryptography;
+using System.Text;
+using System.Threading.Tasks;
+using InsERT.Moria.Dokumenty.Logistyka;
 using InsERT.Moria.Klienci;
 using InsERT.Moria.ModelDanych;
 using InsERT.Moria.Sfera;
 using InsERT.Mox.DataExtensions;
 using InsERT.Mox.ObiektyBiznesowe;
 using Nexo.Invoice;
-using System;
-using System.Collections.Generic;
-using System.IO;
-using System.Linq;
-using System.Security.Cryptography;
-using System.Text;
-using System.Threading.Tasks;
 using Zapqio.Runner.Core;
+using static System.Runtime.InteropServices.JavaScript.JSType;
 
 namespace Nexo
 {
@@ -61,6 +63,11 @@ namespace Nexo
                 });
             }
 
+            if (input.Positions == null || input.Positions.Count == 0)
+            {
+                throw new Exception("Nie uzupełniono pozycji dokumentu");
+            }
+
             using IDokumentSprzedazy invoice = _client.Uchwyt.DokumentySprzedazy().UtworzFaktureSprzedazy();
             var doc = invoice.Dane;
             doc.Magazyn = _client.Uchwyt.Magazyny().Dane.Pierwszy(x => x.Symbol == _settings.Warehouse);
@@ -84,31 +91,32 @@ namespace Nexo
                 }
             }
 
-            // Dla nabywcy z Polski nie ruszamy transakcji handlowej - dokument ma domyślnie ustawione "S"
-            if (doc.Podmiot.AdresPodstawowy.Panstwo.KodISOAlfa2() != "PL")
-            {
-                Console.WriteLine($"Nabywca spoza Polski (państwo: {doc.Podmiot.AdresPodstawowy.Panstwo.KodISOAlfa2()}), ustalanie transakcji handlowej");
-                doc.TransakcjaHandlowa = GetTH(doc.Podmiot);
-            }
 
             if (!string.IsNullOrEmpty(input.Currency))
             {
                 doc.Waluta = GetCurrency(input.Currency);
             }
 
-            if (input.Positions == null || input.Positions.Count == 0)
-            {
-                throw new Exception("Nie uzupełniono pozycji dokumentu");
-            }
 
+            var taxGreaterThanZero = false;
             foreach (var pos in input.Positions)
             {
                 ValidatePosition(pos);
                 var ip = invoice.Pozycje.Dodaj(pos.Symbol);
                 ip.Ilosc = pos.Quantity ?? 0;
-                ip.StawkaVat = GetTax(pos);
+                var tax = GetTax(pos);
+                ip.StawkaVat = tax;
+                taxGreaterThanZero |= tax.Stawka > 0;
                 ip.Cena.NettoPrzedRabatem = pos.NetPrice ?? 0;
             }
+
+            // Dla nabywcy z Polski nie ruszamy transakcji handlowej - dokument ma domyślnie ustawione "S"
+            if (doc.Podmiot.AdresPodstawowy.Panstwo.KodISOAlfa2() != "PL")
+            {
+                Console.WriteLine($"Nabywca spoza Polski (państwo: {doc.Podmiot.AdresPodstawowy.Panstwo.KodISOAlfa2()}), ustalanie transakcji handlowej");
+                doc.TransakcjaHandlowa = GetTH(doc.Podmiot, input.Vies, taxGreaterThanZero);
+            }
+
             invoice.Przelicz();
 
             invoice.SetPayment(GetPaymentType(input.Payment, input.Currency), doc.KwotaDoZaplaty);
@@ -151,23 +159,91 @@ namespace Nexo
             else
             {
                 Console.WriteLine($"Utworzono fakturę: {invoice.Dane.NumerWewnetrzny.PelnaSygnatura}");
+            }
 
-                if (crossYearLicence)
+            var invoiceOut = new InvoiceOut
+            {
+                Number = invoice.Dane.NumerWewnetrzny.PelnaSygnatura
+            };
+            var documentId = invoice.Dane.Id;
+
+            // Po zapisie czekamy, aż Nexo (Asystent / harmonogram KSeF) wyśle fakturę i dostanie numer KSeF.
+            // Wysyłkę robi inny proces, więc dokument czytamy za każdym razem na nowo przez OpenInvoice -
+            // obiekt "invoice" trzymany w pamięci nie zobaczy jej wyniku. Sprawdzamy od razu, a czekamy
+            // dopiero między próbami: faktura, która do KSeF nie idzie (np. konsument z UE), nie blokuje
+            // wywołania na cały limit prób.
+            var attempts = _settings.KsefPollAttempts;
+            var interval = TimeSpan.FromSeconds(Math.Max(10, _settings.KsefPollIntervalSeconds));
+            if (attempts <= 0)
+            {
+                Console.WriteLine($"KSeF: pomijam oczekiwanie na numer KSeF dla {invoiceOut.Number} (KsefPollAttempts = {attempts})");
+            }
+            else
+            {
+                Console.WriteLine($"KSeF: czekam na numer KSeF dla {invoiceOut.Number} - do {attempts} prób co {interval.TotalSeconds:0} s");
+                var resolved = false;
+                StatusKSeF? lastStatus = null;
+                for (var attempt = 1; attempt <= attempts && !resolved; attempt++)
                 {
-                    // Send nie rzuca - nieudane powiadomienie nie ma prawa wywrócić wystawionej faktury.
-                    await _slack.Send(
-                        $"*Faktura {invoice.Dane.NumerWewnetrzny.PelnaSygnatura}* - licencja na przełomie lat "
-                        + $"({input.StartLicenceDate.Value.Year} - {input.EndLicenceDate.Value.Year})\n"
-                        + $"Okres: {input.StartLicenceDate.Value:yyyy-MM-dd} - {input.EndLicenceDate.Value:yyyy-MM-dd}\n"
-                        + $"Nabywca: {doc.Podmiot?.NazwaSkrocona}");
+                    if (attempt > 1)
+                    {
+                        await Task.Delay(interval);
+                    }
+
+                    using var current = OpenInvoice(documentId);
+                    if (current == null)
+                    {
+                        Console.Error.WriteLine($"KSeF: próba {attempt}/{attempts} - nie znaleziono dokumentu {invoiceOut.Number} (Id {documentId})");
+                        continue;
+                    }
+
+                    var status = current.Dane.StatusKSeF();
+                    lastStatus = status;
+                    switch (status)
+                    {
+                        case StatusKSeF.PrzyjetoWKsef:
+                        case StatusKSeF.PobranoUPO:
+                        case StatusKSeF.NumerNadanyRecznie:
+                            // Numer KSeF już jest - UPO Nexo dociąga niezależnie, nie ma na co czekać.
+                            var ksefNumber = current.Dane.PowiazanieZDokumentemElektronicznym?.DokumentElektroniczny?.NumerKSeF;
+                            Console.WriteLine($"KSeF: {invoiceOut.Number} przyjęta - status {status}, numer KSeF: {(string.IsNullOrEmpty(ksefNumber) ? "(brak)" : ksefNumber)} (próba {attempt}/{attempts})");
+                            resolved = true;
+                            break;
+                        case StatusKSeF.BladWysylki:
+                        case StatusKSeF.NiezgodneZeSchematem:
+                        case StatusKSeF.NieDotyczy:
+                        case StatusKSeF.NiePodlegaWysylce:
+                            // Stan końcowy - dalsze odpytywanie nic nie zmieni.
+                            Console.Error.WriteLine($"KSeF: {invoiceOut.Number} nie trafi do KSeF - status {status}, przerywam oczekiwanie (próba {attempt}/{attempts})");
+                            resolved = true;
+                            break;
+                        default:
+                            Console.WriteLine($"KSeF: {invoiceOut.Number} jeszcze bez numeru KSeF - status {status} (próba {attempt}/{attempts})");
+                            break;
+                    }
+                }
+
+                if (!resolved)
+                {
+                    Console.Error.WriteLine($"KSeF: {invoiceOut.Number} nie dostała numeru KSeF w ciągu {attempts} prób ({(attempts - 1) * interval.TotalSeconds:0} s) - ostatni status: {lastStatus?.ToString() ?? "(brak odczytu)"}");
                 }
             }
 
-            return System.Text.Json.JsonSerializer.Serialize(new InvoiceOut
-            {
-                Number = invoice.Dane.NumerWewnetrzny.PelnaSygnatura,
-                Pdf = PrintToPdf(invoice.Dane, input.TemplatePrintLanguage),
-            });
+            // PDF drukujemy z dokumentu odczytanego na nowo - po wysyłce Nexo ma na nim numer KSeF i kod QR,
+            // których obiekt "invoice" z pamięci nie zna.
+            using var refreshed = OpenInvoice(documentId);
+            invoiceOut.Pdf = PrintToPdf(refreshed?.Dane ?? invoice.Dane, input.TemplatePrintLanguage);
+            return System.Text.Json.JsonSerializer.Serialize(invoiceOut);
+        }
+
+        /// <summary>
+        /// Otwiera dokument sprzedaży na nowo - świeży odczyt z bazy do sprawdzania stanu, który zmienia
+        /// inny proces (np. wysyłka do KSeF). Zwraca null, gdy dokumentu nie ma. Wynik trzeba zdisposować.
+        /// </summary>
+        private IObiektBiznesowy<DokumentDS> OpenInvoice(int documentId)
+        {
+            var entity = _client.Uchwyt.DokumentySprzedazy().Dane.Wszystkie().FirstOrDefault(x => x.Id == documentId);
+            return entity == null ? null : _client.Uchwyt.DokumentySprzedazy().Znajdz(entity);
         }
 
         /// <summary>
@@ -188,19 +264,6 @@ namespace Nexo
                 return null;
             }
 
-            // Pole musi istnieć w bazie - inaczej ResolveExtensionProperties rzuca surowym
-            // "Extension property of name '...' not found". Skoro dostaliśmy UniqueId, to kontrola
-            // duplikatów ma działać - lepiej powiedzieć wprost, czego brakuje, niż po cichu
-            // wystawić drugi dokument.
-            //if (PolaWlasneDokumentDS_Adv2.ExtensionProperty(ownFieldName) == null)
-            //{
-            //    throw new Exception($"Nie znaleziono pola własnego '{ownFieldName}' (ZapqInvoiceIdOwnField) na dokumencie sprzedaży - bez niego nie da się sprawdzić, czy faktura o UniqueId '{uniqueId}' już istnieje");
-            //}
-
-            // PolaWlasneAdv2.Get<T>() to zwykła metoda .NET i LINQ to Entities jej nie zna
-            // ("does not recognize the method ... Get[String]"). ResolveExtensionProperties()
-            // przepisuje to wywołanie na kolumnę, w której pole własne faktycznie siedzi - dlatego
-            // musi lecieć na GOTOWYM zapytaniu, PO Where(), a nie przed nim.
             return _client.Uchwyt.DokumentySprzedazy().Dane.Wszystkie()
                 .Where(a => a.PolaWlasneAdv2.Get<string>(ownFieldName) == uniqueId)
                 .ResolveExtensionProperties()
@@ -648,11 +711,15 @@ namespace Nexo
         /// 2-transakcja przedsiębiorca spoza UE - DPTK
         /// 3-Konsument z UE - WSTO-OSS
         /// 4-konsumet spoza UE - DPTK
-        /// 5 dla Polski - S 
+        /// 5 dla Polski - S
+        /// 6-nabywca z UE bez potwierdzenia VIES, a na dokumencie naliczony VAT (stawka > 0
+        ///   na co najmniej jednej pozycji) - WSTO-OSS, nawet jeśli podmiot jest oznaczony jako firma
         /// </summary>
         /// <param name="podmiot"></param>
+        /// <param name="vies">odpowiedź VIES z wejścia; pusta = nabywca nie jest potwierdzonym podatnikiem VAT UE</param>
+        /// <param name="taxGreaterThanZero">czy na co najmniej jednej pozycji naliczono VAT (stawka > 0) - wyliczane przy dodawaniu pozycji</param>
         /// <returns></returns>
-        private TransakcjaHandlowa GetTH(Podmiot podmiot)
+        private TransakcjaHandlowa GetTH(Podmiot podmiot, string vies, bool taxGreaterThanZero)
         {
             var country = podmiot?.AdresPodstawowy?.Panstwo;
             if (country == null)
@@ -661,6 +728,7 @@ namespace Nexo
             }
 
             var isCompany = podmiot.JestFirma();
+            var viesEmpty = string.IsNullOrWhiteSpace(vies);
             string symbol;
             if (country.KodISOAlfa2() == "PL")
             {
@@ -669,6 +737,12 @@ namespace Nexo
             else if (!country.CzlonekUE)
             {
                 symbol = "DPTK";
+            }
+            else if (viesEmpty && taxGreaterThanZero)
+            {
+                // Brak potwierdzenia VIES + naliczony VAT = sprzedaż konsumencka w procedurze OSS,
+                // niezależnie od tego, czy podmiot w Nexo jest oznaczony jako firma.
+                symbol = "WSTO-OSS";
             }
             else if (isCompany)
             {
@@ -685,7 +759,7 @@ namespace Nexo
             {
                 throw new Exception($"Nie znaleziono transakcji handlowej o symbolu: {symbol}");
             }
-            Console.WriteLine($"Wybrano transakcję handlową {symbol} - państwo: {country.KodISOAlfa2()}, członek UE: {country.CzlonekUE}, firma: {isCompany}");
+            Console.WriteLine($"Wybrano transakcję handlową {symbol} - państwo: {country.KodISOAlfa2()}, członek UE: {country.CzlonekUE}, firma: {isCompany}, VIES: {(viesEmpty ? "(brak)" : vies)}");
             return th.Dane;
         }
     }
