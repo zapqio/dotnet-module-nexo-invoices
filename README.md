@@ -2,7 +2,7 @@
 
 Metoda **"Add invoice and pdf"**: wystawia fakturę w InsERT nexo (Subiekt), generuje PDF i powiadamia
 na Slacku. Połączenie z Nexo bierze ze współdzielonego `NexoClient` z paczki
-[Nexo.Connection](https://github.com/zapqio/module-nexo-connection).
+[Nexo.Connection](https://github.com/zapqio/dotnet-module-nexo-connection).
 
 ## Instalacja
 
