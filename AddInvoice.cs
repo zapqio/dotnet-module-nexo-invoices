@@ -22,13 +22,11 @@ namespace Nexo
     {
         private NexoClient _client;
         private readonly Settings _settings;
-        private readonly SlackClient _slack;
 
-        public AddInvoice(NexoClient client, Settings settings, SlackClient slack)
+        public AddInvoice(NexoClient client, Settings settings)
         {           
             _client = client;
             _settings = settings;
-            _slack = slack;
             NexoExtensions.Client = _client;
         }
         public Type InData()

@@ -22,12 +22,6 @@ namespace Nexo
         public string ZapqInvoiceIdOwnField { get; set; }
         public string DefaultTemplatePrint { get; set; }
 
-        /// <summary>Token bota Slacka (xoxb-...) - uzywany przez <see cref="SlackClient"/>.</summary>
-        public string SlackToken { get; set; }
-
-        /// <summary>Domyslny kanal powiadomien, np. "#erp-alerty" albo ID kanalu.</summary>
-        public string SlackChannel { get; set; }
-
         public Dictionary<string, string> MapLaguageToTemplatePrint { get; set; }
 
         /// <summary>

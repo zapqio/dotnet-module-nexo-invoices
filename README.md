@@ -1,7 +1,7 @@
 # Zapqio Runner - moduł Nexo.Invoices
 
-Metoda **"Add invoice and pdf"**: wystawia fakturę w InsERT nexo (Subiekt), generuje PDF i powiadamia
-na Slacku. Połączenie z Nexo bierze ze współdzielonego `NexoClient` z paczki
+Metoda **"Add invoice and pdf"**: wystawia fakturę w InsERT nexo (Subiekt) i generuje PDF.
+Połączenie z Nexo bierze ze współdzielonego `NexoClient` z paczki
 [Nexo.Connection](https://github.com/zapqio/dotnet-module-nexo-connection).
 
 ## Instalacja
@@ -9,7 +9,7 @@ na Slacku. Połączenie z Nexo bierze ze współdzielonego `NexoClient` z paczki
 `Nexo.Invoices.zip` do `Modules\` runnera obok `Nexo.Connection.zip` i `Nexo.Sdk.zip` (SDK InsERT
 w wersji Subiekta, pakuje je `update-nexo-sdk.ps1` z repo Nexo.Connection), restart usługi. Dane połączenia
 są w sekcji `Connect` pliku `Config\nexoModule.json` w katalogu runnera (zakłada go Nexo.Connection); ten
-moduł dopisuje do tego samego pliku własne klucze (magazyn, pola własne, szablony wydruku, Slack, KSeF)
+moduł dopisuje do tego samego pliku własne klucze (magazyn, pola własne, szablony wydruku, KSeF)
 z wartościami domyślnymi przy pierwszym starcie - lista w `Settings.cs`.
 
 Bez `Nexo.Connection.zip` runner zgłosi w logu `Metoda Nexo.AddInvoice ... nie została utworzona`
